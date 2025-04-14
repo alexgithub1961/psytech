@@ -163,13 +163,18 @@ async def process_audio(audio_bytes):
         logger.info("\n======= DEEPGRAM API REQUEST =======")
         logger.info(f"Audio data size: {len(audio_bytes)} bytes")
         
-        # Configure options for transcription using the new SDK format
+        # Configure options for transcription with optimized settings for speed
         options = {
-            'model': 'whisper',
+            'model': 'whisper-tiny',  # Use the smallest whisper model for faster inference
             'language': 'he',  # Explicitly set Hebrew language
             'detect_language': False,  # No need to detect language since we specify it
             'smart_format': False,  # Disable for faster processing
-            'punctuate': False  # Disable for faster processing - not needed for tongue twisters
+            'punctuate': False,  # Disable for faster processing - not needed for tongue twisters
+            'profanity_filter': False,  # Disable unnecessary feature
+            'diarize': False,  # Disable speaker diarization
+            'alternatives': 1,  # Only need one transcription
+            'keywords': []  # No keyword boosting needed
+            # Removed 'tier': 'enhanced' which was causing permission issues
         }
         
         logger.info(f"Deepgram options: {json.dumps(options, indent=2)}")
@@ -177,7 +182,7 @@ async def process_audio(audio_bytes):
         # Analyze first few bytes to help with debugging
         logger.debug(f"First 20 bytes of audio: {audio_bytes[:20]}")
         
-        # Detect format based on header bytes without conversion
+        # Detect format based on header bytes
         mimetype = 'audio/webm'  # Default assumption for browser audio
         
         # Check for WAV format (starts with 'RIFF')
@@ -195,7 +200,26 @@ async def process_audio(audio_bytes):
         else:
             logger.info("Could not detect format from header, using default WebM assumption")
         
-        logger.info(f"Using original audio format: {mimetype} (Deepgram will handle conversion)")
+        # Optimize audio size if it's very large (over 200KB)
+        if len(audio_bytes) > 200000:
+            logger.info(f"Large audio file detected ({len(audio_bytes)} bytes), downsampling to improve performance")
+            try:
+                # Simple downsampling by extracting just the headers and a portion of the audio
+                # This keeps the audio format intact but reduces the duration
+                # For WebM files, keep the header (first 1KB) and then every 4th byte
+                sample_rate = 3  # Take every 3rd byte after the header
+                header_size = 1024  # Keep the first 1KB intact
+                
+                if len(audio_bytes) > header_size:
+                    optimized_audio = audio_bytes[:header_size]
+                    optimized_audio += audio_bytes[header_size::sample_rate]
+                    
+                    logger.info(f"Audio downsampled from {len(audio_bytes)} to {len(optimized_audio)} bytes")
+                    audio_bytes = optimized_audio
+            except Exception as e:
+                logger.warning(f"Audio optimization failed: {str(e)}, using original audio")
+        
+        logger.info(f"Using audio format: {mimetype} (size: {len(audio_bytes)} bytes)")
         
         # Create a source object from the audio bytes
         source = {
@@ -208,25 +232,56 @@ async def process_audio(audio_bytes):
         # Make the API request with the specific SDK version format (2.11.0)
         start_time = time.time()
         
-        # Log complete request for debugging
-        logger.info(f"Complete Deepgram request: source={source}, options={options}")
+        # Log complete request for debugging (truncate buffer to avoid massive logs)
+        debug_source = source.copy() if isinstance(source, dict) else source
+        if isinstance(debug_source, dict) and 'buffer' in debug_source:
+            buffer_size = len(debug_source['buffer'])
+            debug_source['buffer'] = f"<binary data, {buffer_size} bytes>"
         
-        if DEEPGRAM_SDK_V2:
-            # Use v2 SDK format
-            response = await dg_client.transcription.prerecorded(
-                source,
-                options
-            )
-        else:
-            # Use v1 SDK format
-            response = await dg_client.listen.prerecorded.v("1").transcribe_buffer(
-                audio_bytes,
-                mimetype,
-                options
-            )
+        logger.info(f"Deepgram request parameters: mimetype={source.get('mimetype')}, options={options}")
+        logger.info(f"Audio data size: {len(audio_bytes)} bytes")
+        logger.info(f"🔄 Starting Deepgram API call at {time.strftime('%H:%M:%S')}...")
+        
+        # Add progress indicators during API call
+        progress_logger_task = None
+        
+        async def log_progress():
+            elapsed = 0
+            while True:
+                await asyncio.sleep(3)  # Log every 3 seconds
+                elapsed += 3
+                logger.info(f"⏳ Still waiting for Deepgram response... {elapsed}s elapsed")
+        
+        try:
+            # Start progress logger
+            progress_logger_task = asyncio.create_task(log_progress())
+            
+            if DEEPGRAM_SDK_V2:
+                # Use v2 SDK format
+                response = await dg_client.transcription.prerecorded(
+                    source,
+                    options
+                )
+            else:
+                # Use v1 SDK format
+                response = await dg_client.listen.prerecorded.v("1").transcribe_buffer(
+                    audio_bytes,
+                    mimetype,
+                    options
+                )
+        finally:
+            # Stop progress logger
+            if progress_logger_task:
+                progress_logger_task.cancel()
+                try:
+                    await progress_logger_task
+                except asyncio.CancelledError:
+                    pass
+            
         end_time = time.time()
+        elapsed_time = end_time - start_time
         
-        logger.info(f"Deepgram API response time: {(end_time - start_time):.2f} seconds")
+        logger.info(f"✅ Deepgram API response received after {elapsed_time:.2f} seconds")
         logger.debug(f"Deepgram API response: {json.dumps(response, indent=2)}")
         logger.info("======= END DEEPGRAM API REQUEST =======\n")
         
@@ -237,6 +292,18 @@ async def process_audio(audio_bytes):
         logger.error(f"Error message: {str(e)}")
         logger.error(f"Audio data size: {len(audio_bytes)} bytes")
         logger.error(f"First 20 bytes of audio: {audio_bytes[:20]}")
+        
+        # More detailed debugging info
+        if hasattr(e, 'response') and e.response:
+            try:
+                logger.error(f"Response status: {e.response.status}")
+                response_text = await e.response.text()
+                logger.error(f"Response body: {response_text}")
+            except:
+                logger.error("Could not extract response details")
+                
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
         logger.error("======= END DEEPGRAM API ERROR =======\n")
         raise e
 

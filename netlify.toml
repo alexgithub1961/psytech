@@ -1,0 +1,19 @@
+[build]
+  command = "chmod +x netlify.sh && ./netlify.sh"
+  publish = "."
+  functions = "netlify/functions"
+
+[build.environment]
+  PYTHON_VERSION = "3.9"
+  PYTHONUNBUFFERED = "1"
+  PIP_TARGET = ".netlify/functions-build"
+
+[dev]
+  command = "python app.py"
+  port = 5000
+  publish = "."
+
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/api"
+  status = 200

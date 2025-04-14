@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: psytech-hebrew-tongue-twisters
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: DEEPGRAM_API_KEY
+        sync: false
+    plan: free

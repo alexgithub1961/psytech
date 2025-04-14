@@ -631,13 +631,13 @@
                 }
             }, 100);
             
-            // Safety timeout - automatically stop recording after 10 seconds
+            // Safety timeout - automatically stop recording after 5 seconds (reduced for faster processing)
             setTimeout(() => {
                 if (mediaRecorder && mediaRecorder.state === 'recording') {
-                    console.log('Stopping recording due to maximum duration (10s)');
+                    console.log('Stopping recording due to maximum duration (5s)');
                     stopRecording();
                 }
-            }, 10000);
+            }, 5000);
         }
         
         // Stop recording function

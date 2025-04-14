@@ -1,0 +1,17 @@
+{
+  "name": "psytech-hebrew-tongue-twisters",
+  "version": "1.0.0",
+  "description": "Hebrew Tongue Twisters Web Application",
+  "main": "index.js",
+  "scripts": {
+    "start": "python app.py",
+    "build": "bash netlify_start.sh"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "keywords": ["hebrew", "tongue-twisters", "speech", "flask"],
+  "author": "",
+  "license": "ISC"
+}
