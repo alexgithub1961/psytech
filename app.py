@@ -1,11 +1,54 @@
 import os
 import json
 import random
+import time
+import base64
+import asyncio
+import numpy as np
 from flask import Flask, render_template, request, jsonify
 from dotenv import load_dotenv
+# Import Deepgram SDK with version-specific handling
+try:
+    # Try importing SDK v2
+    from deepgram import Deepgram
+    DEEPGRAM_SDK_V2 = True
+except ImportError:
+    # Fallback to SDK v1
+    from deepgram import DeepgramClient
+    DEEPGRAM_SDK_V2 = False
+from asgiref.sync import async_to_sync
+import logging
+import sys
+
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('app.log')
+    ]
+)
+logger = logging.getLogger('psytech')
 
 # Load environment variables
 load_dotenv()
+
+# Initialize Deepgram client - you'll need to set DEEPGRAM_API_KEY in your .env file
+DEEPGRAM_API_KEY = os.getenv('DEEPGRAM_API_KEY')
+
+# Check if API key is set
+if not DEEPGRAM_API_KEY or DEEPGRAM_API_KEY == 'your-api-key':
+    logger.error("DEEPGRAM_API_KEY is not set in .env file. Please add your Deepgram API key.")
+    # We'll continue but warn the user
+
+# Initialize the client with the correct SDK format based on version
+if DEEPGRAM_SDK_V2:
+    logger.info("Using Deepgram SDK v2")
+    dg_client = Deepgram(DEEPGRAM_API_KEY)
+else:
+    logger.info("Using Deepgram SDK v1")
+    dg_client = DeepgramClient(DEEPGRAM_API_KEY)
 
 app = Flask(__name__)
 
@@ -59,6 +102,290 @@ def get_random():
     
     random_tongue_twister = random.choice(generated_tongue_twisters)
     return jsonify({'success': True, 'tongue_twister': random_tongue_twister})
+
+# Store the last shown tongue twister and its timestamp
+last_tongue_twister = {
+    'text': '',
+    'timestamp': 0
+}
+
+@app.route('/set-current', methods=['POST'])
+def set_current_tongue_twister():
+    global last_tongue_twister
+    
+    data = request.json
+    if 'tongue_twister' not in data:
+        return jsonify({'success': False, 'message': 'No tongue twister provided'})
+    
+    last_tongue_twister['text'] = data['tongue_twister']
+    last_tongue_twister['timestamp'] = time.time()
+    
+    return jsonify({'success': True})
+
+def calculate_similarity(text1, text2):
+    """Calculate similarity between two Hebrew texts (0-100)"""
+    # In a real implementation, you would use a more sophisticated algorithm
+    # This is a simple character-based comparison for demonstration
+    
+    # Remove spaces and convert to lowercase for comparison
+    text1 = text1.replace(' ', '').lower()
+    text2 = text2.replace(' ', '').lower()
+    
+    # Calculate Levenshtein distance
+    def levenshtein_distance(s1, s2):
+        if len(s1) < len(s2):
+            return levenshtein_distance(s2, s1)
+        if len(s2) == 0:
+            return len(s1)
+        
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        
+        return previous_row[-1]
+    
+    # Calculate distance and similarity percentage
+    distance = levenshtein_distance(text1, text2)
+    max_len = max(len(text1), len(text2))
+    similarity = max(0, 100 - (distance / max_len * 100)) if max_len > 0 else 0
+    
+    return round(similarity, 2)
+
+# Helper function for async Deepgram API call
+async def process_audio(audio_bytes):
+    try:
+        logger.info("\n======= DEEPGRAM API REQUEST =======")
+        logger.info(f"Audio data size: {len(audio_bytes)} bytes")
+        
+        # Configure options for transcription using the new SDK format
+        options = {
+            'model': 'whisper',
+            'language': 'he',  # Explicitly set Hebrew language
+            'detect_language': False,  # No need to detect language since we specify it
+            'smart_format': False,  # Disable for faster processing
+            'punctuate': False  # Disable for faster processing - not needed for tongue twisters
+        }
+        
+        logger.info(f"Deepgram options: {json.dumps(options, indent=2)}")
+        
+        # Analyze first few bytes to help with debugging
+        logger.debug(f"First 20 bytes of audio: {audio_bytes[:20]}")
+        
+        # Detect format based on header bytes without conversion
+        mimetype = 'audio/webm'  # Default assumption for browser audio
+        
+        # Check for WAV format (starts with 'RIFF')
+        if len(audio_bytes) > 4 and audio_bytes[:4] == b'RIFF':
+            mimetype = 'audio/wav'
+            logger.info("Detected WAV format")
+        # Check for WebM format
+        elif len(audio_bytes) > 4 and audio_bytes[0] == 0x1A and audio_bytes[1] == 0x45 and audio_bytes[2] == 0xDF and audio_bytes[3] == 0xA3:
+            mimetype = 'audio/webm'
+            logger.info("Detected WebM format")
+        # Check for Opus in OGG container
+        elif len(audio_bytes) > 4 and audio_bytes[:4] == b'OggS':
+            mimetype = 'audio/ogg'
+            logger.info("Detected OGG format")
+        else:
+            logger.info("Could not detect format from header, using default WebM assumption")
+        
+        logger.info(f"Using original audio format: {mimetype} (Deepgram will handle conversion)")
+        
+        # Create a source object from the audio bytes
+        source = {
+            'buffer': audio_bytes,
+            'mimetype': mimetype
+        }
+        
+        logger.info(f"Sending request to Deepgram API with mimetype: {source['mimetype']}")
+        
+        # Make the API request with the specific SDK version format (2.11.0)
+        start_time = time.time()
+        
+        # Log complete request for debugging
+        logger.info(f"Complete Deepgram request: source={source}, options={options}")
+        
+        if DEEPGRAM_SDK_V2:
+            # Use v2 SDK format
+            response = await dg_client.transcription.prerecorded(
+                source,
+                options
+            )
+        else:
+            # Use v1 SDK format
+            response = await dg_client.listen.prerecorded.v("1").transcribe_buffer(
+                audio_bytes,
+                mimetype,
+                options
+            )
+        end_time = time.time()
+        
+        logger.info(f"Deepgram API response time: {(end_time - start_time):.2f} seconds")
+        logger.debug(f"Deepgram API response: {json.dumps(response, indent=2)}")
+        logger.info("======= END DEEPGRAM API REQUEST =======\n")
+        
+        return response
+    except Exception as e:
+        logger.error("\n======= DEEPGRAM API ERROR =======")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.error(f"Audio data size: {len(audio_bytes)} bytes")
+        logger.error(f"First 20 bytes of audio: {audio_bytes[:20]}")
+        logger.error("======= END DEEPGRAM API ERROR =======\n")
+        raise e
+
+@app.route('/evaluate-speech', methods=['POST'])
+def evaluate_speech():
+    global last_tongue_twister
+    
+    # Check if we have a tongue twister to compare against
+    if not last_tongue_twister['text']:
+        return jsonify({
+            'success': False, 
+            'message': 'No tongue twister has been selected yet'
+        })
+    
+    # Get audio data from the request
+    data = request.json
+    if 'audio_data' not in data:
+        return jsonify({
+            'success': False, 
+            'message': 'No audio data provided'
+        })
+    
+    try:
+        # Decode the base64 audio data
+        try:
+            # Handle different formats of base64 data
+            audio_data = data['audio_data']
+            if ',' in audio_data:
+                # Format: data:audio/webm;base64,BASE64DATA
+                audio_bytes = base64.b64decode(audio_data.split(',')[1])
+            else:
+                # Format: Just the BASE64DATA
+                audio_bytes = base64.b64decode(audio_data)
+            
+            logger.info(f'Audio data size: {len(audio_bytes)} bytes')
+        except IndexError:
+            return jsonify({
+                'success': False, 
+                'message': 'Invalid audio data format'
+            })
+        
+        # Calculate time taken (in seconds)
+        end_time = time.time()
+        time_taken = end_time - last_tongue_twister['timestamp']
+        
+        # Use the async helper function with async_to_sync
+        response = async_to_sync(process_audio)(audio_bytes)
+        
+        # Debug the response
+        logger.info(f'Deepgram response received')
+        logger.debug(f'Deepgram response: {json.dumps(response, indent=2)}')
+        
+        # Extract the transcription with better error handling for the installed SDK version
+        try:
+            # Extract transcription based on SDK version and response format
+            transcription = ''
+            
+            # Log the response type and keys for debugging
+            logger.info(f"Response type: {type(response)}")
+            if isinstance(response, dict):
+                logger.info(f"Response keys: {list(response.keys())}")
+                
+                # SDK v1 format
+                if 'results' in response:
+                    logger.info("Parsing SDK v1 response format")
+                    if 'channels' in response['results'] and len(response['results']['channels']) > 0:
+                        alternatives = response['results']['channels'][0].get('alternatives', [])
+                        if alternatives and len(alternatives) > 0:
+                            transcription = alternatives[0].get('transcript', '')
+                # SDK v2 format
+                elif 'channel' in response:
+                    logger.info("Parsing SDK v2 response format")
+                    alternatives = response.get('channel', {}).get('alternatives', [])
+                    if alternatives and len(alternatives) > 0:
+                        transcription = alternatives[0].get('transcript', '')
+                # Alternative format seen in some SDK versions
+                elif 'channels' in response and len(response['channels']) > 0:
+                    logger.info("Parsing alternative SDK response format")
+                    alternatives = response['channels'][0].get('alternatives', [])
+                    if alternatives and len(alternatives) > 0:
+                        transcription = alternatives[0].get('transcript', '')
+                # Raw string or unexpected format
+                elif 'transcript' in response:
+                    logger.info("Found transcript directly in response")
+                    transcription = response['transcript']
+            
+            # Log the extracted transcription
+            logger.info(f"Extracted transcription: {transcription}")
+                
+            # If no transcription was found, return an error
+            if not transcription:
+                return jsonify({
+                    'success': False,
+                    'message': 'No speech detected or transcription failed'
+                })
+        except Exception as e:
+            print(f'Error parsing Deepgram response: {str(e)}')
+            return jsonify({
+                'success': False,
+                'message': f'Error parsing transcription: {str(e)}'
+            })
+        
+        # Calculate accuracy (0-100)
+        accuracy = calculate_similarity(last_tongue_twister['text'], transcription)
+        
+        # Calculate score as product of accuracy and time efficiency
+        # For time efficiency: faster is better, with a cap at 10 seconds
+        time_factor = max(0, 100 - (time_taken * 10)) if time_taken < 10 else 0
+        
+        # Final score is the product of accuracy and time factor, divided by 100 to scale to 0-100
+        score = (accuracy * time_factor) / 100
+        
+        return jsonify({
+            'success': True,
+            'transcription': transcription,
+            'original': last_tongue_twister['text'],
+            'accuracy': accuracy,
+            'time_taken': round(time_taken, 2),
+            'time_factor': round(time_factor, 2),
+            'score': round(score, 2)
+        })
+        
+    except Exception as e:
+        error_message = str(e)
+        logger.error(f'Error in evaluate_speech: {error_message}')
+        
+        # Provide more helpful error messages based on common issues
+        if 'Bad Request' in error_message:
+            # Check for API key issues
+            if not DEEPGRAM_API_KEY or DEEPGRAM_API_KEY == 'your-api-key':
+                return jsonify({
+                    'success': False,
+                    'message': 'Missing or invalid Deepgram API key. Please check your .env file.'
+                })
+            # Audio format issues
+            return jsonify({
+                'success': False,
+                'message': 'Deepgram could not process the audio format. Try speaking more clearly or for a longer duration.'
+            })
+        elif 'Unauthorized' in error_message:
+            return jsonify({
+                'success': False,
+                'message': 'Invalid Deepgram API key. Please check your .env file.'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'message': f'Error processing audio: {error_message}'
+            })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
